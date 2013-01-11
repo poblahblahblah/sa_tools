@@ -1,0 +1,279 @@
+#!/usr/bin/ruby -w
+require 'date'
+require 'digest/md5'
+require 'erb'
+require 'optparse'
+require 'open3'
+
+# I looked into using Ruby's svn bindings but they are a poorly documented mess. - pobrien@ - 02/2011
+# cleaned up a few things, split a method up, made the STDIN stuff less horrible - pobrien@ - 12/2011
+
+# first let's do a check to make sure that this is the most current revision of this script
+# or in general that the repo is up to date. this actually isn't an ideal way of doing this
+# since it checks the directories rev number to see if it's up to date or not, so before
+# doing any commit you will have to update, at the very least, the "tools" directory in
+# the sysadmin repo. I suppose this is better than folks using an out of date script, though.
+current_dir = Dir.getwd
+Dir.chdir(File.dirname(current_dir) + "/tools")
+current_script_rev    = `svn info  | grep "Revision"`.split(" ")[-1]
+subversion_script_rev = `svn info https://subversion.eharmony.com/sysadmin  | grep "Revision"`.split(" ")[-1]
+Dir.chdir(current_dir)
+if current_script_rev != subversion_script_rev
+  abort "It appears your dns-commit script is out of date, please svn update."
+end
+
+###########
+# opt parse
+###########
+options     = {}
+opts        = OptionParser.new
+opts.banner = 'Usage: ../tools/dns_commit -m "your message here"'
+opts.separator "Arguments"
+opts.on("-m", "--message <commit message>", "commit message") do |opt|
+  options[:message] = opt
+end
+opts.on("-h", "--help", "Show this help message.") do
+  puts opts
+  exit
+end
+
+opts.parse(ARGV)
+message = options[:message]
+(puts opts ; exit) if options.empty?
+
+###########
+# variables
+###########
+internal_named                 = %W(ns1 ns2)
+external_named                 = %W(extns1 extns2)
+zones_to_ignore                = 'db.cache$|db.127.0.0$|db.localhost$|PROD_SSVM'
+list_of_zone_files             = {}
+list_of_zone_files['internal'] = Dir.glob('db.*').delete_if      {|x| x =~ /#{zones_to_ignore}/}
+list_of_zone_files['external'] = Dir.glob("ext/db.**").delete_if {|x| x =~ /#{zones_to_ignore}/}
+ignore_regex                   = 'localhost|127.0.0.1|;(\s|\t)*dupe|;(\s|\t)*RR|;(\s|\t)*ignore|^;'
+whitelist_regex                = '(\s|\t)(A|AAAA)(\s|\t)'
+user                           = ENV['SUDO_USER'] if ENV.has_key?('SUDO_USER')
+user                           = ENV['USER'] if !ENV.has_key?('SUDO_USER')
+
+#########
+# methods
+#########
+# grab a list of modified files, raise if a file in conflict is found.
+# probably a prettier way to do this.
+def svn_status(current_dir)
+  modified_files = []
+  `svn status #{current_dir}`.split(/\n/).map do |file|
+     file =~ /(\?|\!|\~|\*|\+|A|C|D|I|M|S|X)\s*([\w\W]*)/
+
+     if file =~ /^M/
+       modified_files << file.split[-1]
+     elsif file =~ /^C/
+       raise "ERROR: file found in conflict: #{file.split[-1]}"
+     end
+  end
+  return modified_files
+end
+
+# this updates the serial number of the zone files.
+def new_serial(zonefile)
+  date_string = Date.today.to_s.delete('-')
+  IO.foreach(zonefile) do |line|
+    if line =~ / ; serial$/
+      serial, semicolon, info = line.split
+      if serial.chop.chop.to_i == date_string.to_i
+        new_serial = serial.to_i + 1
+      else
+        new_serial = date_string + '00'
+      end
+      content  = File.read(zonefile).gsub(/#{serial} ; serial$/, "#{new_serial} ; serial")
+      new_file = File.new(zonefile, "w")
+      new_file.write(content)
+      new_file.close
+    end
+  end
+end
+
+def get_ptr_zones(whitelist_regex, ignore_regex, zones_to_ignore, list_of_zone_files)
+  zones = {}
+  %W(internal external).each do |location|
+    zones[location] = {}
+    list_of_zone_files[location].each do |zf|
+      IO.foreach(zf) do |line|
+        next if line =~ /#{ignore_regex}/
+        next if line !~ /#{whitelist_regex}/
+        next if line.strip.empty? || line.strip.nil?
+        # this is where we grab the name of the zone by reversing the octets order
+        # of the clients IP address and dropping the "last" octet in the IP
+        ptr_zone      = line.split[-1].split('.').reverse.drop(1).join('.')
+        ptr_zone_name = ptr_zone + '.in-addr.arpa'
+        domain        = zf.sub('db', '') if location == 'internal'
+        domain        = zf.sub('ext/db', '') if location == 'external'
+        if zones[location][ptr_zone_name].nil?
+          zones[location][ptr_zone_name] = {}
+        end
+        zones[location][ptr_zone_name][line.split[-1]] = line.split[0] + domain
+      end
+    end
+  end
+  return zones
+end
+
+def generate_ptr_zones(zones)
+  %W(internal external).each do |location|
+    # for now it's been decided to skip ptr generation for external zones.
+    # I am going to keep everything in here that generates it in case we 
+    # decide that we want this functionality for external zones in the future.
+    # to enable the functionality just delete the line below:
+    next if location  == "external"
+    include_ptr        = ""
+    include_ptr_slaves = ""
+    zones[location].keys.sort.each do |filename|
+    dir = ""     if location == "internal"
+    dir = "ext/" if location == "external"
+    serial = ""
+      next if filename == '.in-addr.arpa'
+      # if the file does not exist we need to create a new one and add it:
+      if !File.exist?("#{dir}ptr/#{filename}")
+        # Empty PTR zone files:
+        content  = ERB.new(File.open("templates/ptr.erb"){ |f| f.read}).result(binding)
+        new_file = File.new("#{dir}ptr/#{filename}", "w")
+        new_file.write(content)
+        new_file.close
+        `svn add "#{dir}ptr/#{filename}"`
+      end
+      IO.foreach("#{dir}ptr/#{filename}") do |line|
+        # here we want to grab an already populated PTR zone and check to see if we
+        # need to update the serial number in the zone file. We basically create a 
+        # string with the contents of both files, turn it into an array (splitting
+        # on the newline) and then we delete the line which has the serial. After
+        # that we compare the two strings to see if they match. If they do match then
+        # nothing needs to be done, if they don't then we update the serial.
+        serial, semicolon, info = line.split if line =~ / ; serial$/
+      end
+
+      newzone     = ERB.new(File.open("templates/ptr.erb"){ |f| f.read}).result(binding).gsub(/1000000000 ; serial$/, "#{serial} ; serial")
+      oldzone     = IO.read("#{dir}ptr/#{filename}")
+      newzone_md5 = Digest::MD5.hexdigest(newzone.split("\n").delete_if {|x| x =~ /; serial$/}.join("\n"))
+      oldzone_md5 = Digest::MD5.hexdigest(oldzone.split("\n").delete_if {|x| x =~ /; serial$/}.join("\n"))
+      if newzone_md5 != oldzone_md5
+        file = File.new("#{dir}ptr/#{filename}", "w")
+        file.write(newzone)
+        file.close
+      end
+      # the include_ptr.conf file is a file which the masters (and resolvers, although
+      # we have to add that manually) pick up for all of the reverse zones. This file
+      # is generated automatically, and the master's named.conf just has an include for it.
+      # we may want to move this to it's own method, since the generation of forward zones
+      # has one.
+      include_ptr        << ERB.new(File.open("templates/include_ptr.conf.erb"){ |f| f.read}).result(binding)
+
+      # write out include_ptr.conf:
+      file = File.new("#{dir}include_ptr.conf", "w")
+      file.write(include_ptr)
+      file.close
+
+      if location == "internal"
+        # since we have our own internal slaves, etch needs to know about the reverse zones:
+        include_ptr_slaves << ERB.new(File.open("templates/include_ptr.conf.slaves.erb"){ |f| f.read}).result(binding)
+
+        # write out include_ptr.conf:
+        file = File.new("etch_data/include_ptr.conf", "w")
+        file.write(include_ptr_slaves)
+        file.close
+      end
+    end
+  end
+end
+
+def generate_fwd_include(list_of_zone_files)
+  %W(external).each do |location|
+    dir = ""     if location == "internal"
+    dir = "ext/" if location == "external"
+    include_fwd = ""
+    list_of_zone_files[location].sort.each do |filename|
+      include_fwd << ERB.new(File.open("templates/include_fwd.conf.erb"){|f| f.read}).result(binding)
+      file = File.new("#{dir}include_fwd.conf", "w")
+      file.write(include_fwd)
+      file.close
+    end
+  end
+end
+
+#########
+# do work
+#########
+# check to see if named-checkzone is installed. it should be.
+if `uname -a | grep -i 'Darwin'` == true
+  ncz = '/opt/local/sbin/named-checkzone'
+else
+  ncz = '/usr/sbin/named-checkzone'
+end
+
+# make sure check-namedzone exists, if not abort.
+if !File.exist?(ncz)
+  abort "Please install bind9utils via apt if you are on Ubuntu/Debian, bind9 via ports if you are on OSX, or bind via yum if you are on Fedora/RHEL/CentOS"
+end
+
+# generate include_fwd.conf file, only used for external resolvers
+generate_fwd_include(list_of_zone_files)
+
+# generate the ptr zone files
+generate_ptr_zones(get_ptr_zones(whitelist_regex, ignore_regex, zones_to_ignore, list_of_zone_files))
+
+# update serials of all modified files
+svn_status(current_dir).each {|status| new_serial(status.to_s)}
+
+# use named-checkzone to check the zone changes.
+# the syntax for named-checkzone is "named-checkzone <domain> <zonefile>"
+%W(internal external).each do |location|
+  list_of_zone_files[location].each do |zonefile|
+    zone = zonefile.gsub('db.', '')     if location == "internal"
+    zone = zonefile.gsub('ext/db.', '') if location == "external"
+    ncz_command = "#{ncz} #{zone} #{zonefile}"
+    if system("#{ncz_command} > /dev/null") == false
+      puts "#{zonefile} had errors!!!!\nPlease correct them before commiting.\n"
+      system("#{ncz_command}")
+      abort
+    end
+  end
+end
+
+# display a diff to the user
+system("svn diff")
+
+# quick routine to have the user type 'y' or 'yes'
+while true do
+  print "Are you sure you want to commit these changes? "
+  s = STDIN.gets
+  redo  if s.nil? || s !~ /(^y|^n|^exit$)/i
+  break if !s.nil? && s =~ /^y/i
+  exit  if !s.nil? && s =~ /(^n|^exit$)/i
+end
+
+# quick and dirty thing to figure out what nameservers we have to connect to to update and reload bind.
+update_internal       = false
+update_external       = false
+stdin, stdout, stderr = Open3.popen3("svn status")
+
+stdout.readlines.each do |line|
+  update_internal = true if line.split[-1] =~ /(^db|^ptr)/i
+  update_external = true if line.split[-1] =~ /^ext/i
+end
+
+# commit the changes
+system("svn commit -m \"#{message}\"")
+
+# connect to the named servers and restart bind
+if update_internal == true
+  puts "restarting bind on #{internal_named.join(' and ')}"
+  internal_named.each do |ns|
+    system("ssh -t -l #{user} #{ns} 'cd /var/named/chroot/etc/namedb && sudo -u named svn update && sudo /etc/init.d/named reload && sleep 5 && sudo /etc/init.d/named status'")
+  end
+end
+if update_external == true
+  puts "restarting bind on #{external_named.join(' and ')}"
+  external_named.each do |ns|
+    system("ssh -t -l #{user} #{ns} 'cd /var/named/chroot/etc/namedb && sudo -u named svn update && sudo /etc/init.d/named reload && sleep 5 && sudo /etc/init.d/named status'")
+  end
+end
+
