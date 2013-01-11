@@ -1,0 +1,12 @@
+---
+oracle:
+  source_dir: /mnt/dd880-01/rman/backup/oracle
+  file_glob: "{spfile_*,control_*,full_2012_06_12*,arch_2012_06_12*}"
+---
+subversion:
+  source_dir: /mnt/dd880-01/svn/archive
+  file_glob: **/**
+---
+git:
+  source_dir: /mnt/dd880-01/git/daily
+  file_glob: **/**
